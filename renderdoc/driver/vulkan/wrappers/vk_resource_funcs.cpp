@@ -326,7 +326,7 @@ bool WrappedVulkan::Serialise_vkAllocateMemory(SerialiserType &ser, VkDevice dev
           //
           // instead we do the more dangerous thing of adjusting the allocation size to match the
           // image's memory requirements and keep the dedicated allocation.
-          if(AccelerationStructures() || DescriptorBuffers())
+          if(AccelerationStructures() || DescriptorBuffers() || DescriptorHeaps())
             patched.allocationSize = mrq.size;
           else
             RemoveNextStruct(&patched, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
@@ -2135,7 +2135,8 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
   if(IsCaptureMode(m_State))
   {
     // If we're using this buffer for AS or OMM storage we need to enable BDA
-    if(adjusted_usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+    if(adjusted_usage & (VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                         VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT))
       adjusted_usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
     // If we're using this buffer for device addresses, ensure we force on capture replay bit.
@@ -2188,7 +2189,8 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
 
       uint64_t serialisedUsage = GetBufferUsageFlags(&serialisedCreateInfo);
       // If we're using this buffer for AS storage we need to enable BDA
-      if(serialisedUsage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+      if(serialisedUsage & (VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                            VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT))
         serialisedUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
       SetBufferUsageFlags(&serialisedCreateInfo, serialisedUsage);
 
@@ -3002,11 +3004,38 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
       VkImageCreateInfo serialisedCreateInfo = *pCreateInfo;
 
       OpaqueDataForSerialising opaqueData;
+      bytebuf heapOpaqueData;
+      VkHostAddressRangeConstEXT heapOpaqueRange = {};
+      VkOpaqueCaptureDataCreateInfoEXT heapOpaqueInfo = {
+          VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT,
+      };
 
       if(DescriptorBuffers())
       {
         opaqueData.fill(device, *pImage, m_DescriptorBufferProperties);
         opaqueData.addForSerialising((VkBaseInStructure *)&serialisedCreateInfo);
+      }
+
+      if(DescriptorHeaps())
+      {
+        heapOpaqueData.resize(m_DescriptorHeapProperties.imageCaptureReplayOpaqueDataSize);
+        VkHostAddressRangeEXT outputRange = {heapOpaqueData.data(), heapOpaqueData.size()};
+        VkImage unwrappedImage = Unwrap(*pImage);
+        VkResult opaqueResult = ObjDisp(device)->GetImageOpaqueCaptureDataEXT(
+            Unwrap(device), 1, &unwrappedImage, &outputRange);
+        if(opaqueResult != VK_SUCCESS)
+        {
+          RDCERR("Couldn't get descriptor heap image capture/replay data: %s",
+                 ToStr(opaqueResult).c_str());
+        }
+        else
+        {
+          heapOpaqueRange.address = heapOpaqueData.data();
+          heapOpaqueRange.size = heapOpaqueData.size();
+          heapOpaqueInfo.pData = &heapOpaqueRange;
+          heapOpaqueInfo.pNext = serialisedCreateInfo.pNext;
+          serialisedCreateInfo.pNext = &heapOpaqueInfo;
+        }
       }
 
       {
@@ -3023,7 +3052,7 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
 
       // can't differentiate whether this image will be used with descriptor buffers, must force
       // reference all images
-      if(DescriptorBuffers())
+      if(DescriptorBuffers() || DescriptorHeaps())
         AddForcedReference(record);
 
       record->resInfo = new ResourceInfo();
@@ -4097,12 +4126,13 @@ VkResult WrappedVulkan::vkCreateAccelerationStructureKHR(
 
       GetResourceManager()->MarkDirtyResource(id);
       if(pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
-         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR || DescriptorBuffers())
+         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR || DescriptorBuffers() ||
+         DescriptorHeaps())
       {
         // We force reference BLASs as it is not feasible to track at the API level which TLASs
         // reference them.  We force ref generics too as they could bottom or top level so we
         // conservatively assume they are bottom
-        // when descriptor buffers are enabled, we must force reference all ASs
+        // when descriptor buffers or heaps are enabled, we must force reference all ASs
         AddForcedReference(record);
 
         // in case we're currently capturing, immediately consider the AS as referenced

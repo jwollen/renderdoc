@@ -2286,6 +2286,25 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
       ret.compute.descriptorBuffers[i].buffer = id;
     }
 
+    if(state.descriptorHeapState)
+    {
+      if(state.samplerHeap.bound)
+      {
+        VKPipe::DescriptorBuffer heap;
+        heap.samplerBuffer = true;
+        m_pDriver->GetResIDFromAddr(state.samplerHeap.address, heap.buffer, heap.offset);
+        ret.compute.descriptorBuffers.push_back(heap);
+      }
+
+      if(state.resourceHeap.bound)
+      {
+        VKPipe::DescriptorBuffer heap;
+        heap.resourceBuffer = true;
+        m_pDriver->GetResIDFromAddr(state.resourceHeap.address, heap.buffer, heap.offset);
+        ret.compute.descriptorBuffers.push_back(heap);
+      }
+    }
+
     // these are not actually pipeline specific but for organisation/ease we store them there
     ret.graphics.descriptorBuffers = ret.compute.descriptorBuffers;
   }
@@ -2682,12 +2701,16 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
     return ret;
   }
 
-  // check for a descriptor buffer
+  // check for a descriptor buffer or descriptor heap
   if(WrappedVkBuffer::IsAlloc(rm->GetResource(descriptorStore)) &&
      (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
       (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)) != 0)
+       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+       VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT)) != 0)
   {
+    const bool descriptorHeap =
+        (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
+         VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT) != 0;
     // we assume batched queries, so get the whole descriptor buffer at once
     bytebuf data;
     GetBufferData(descriptorStore, 0, 0, data);
@@ -2701,7 +2724,7 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
 
       for(uint32_t i = 0; i < r.count; i++)
       {
-        if(r.type == DescriptorType::Sampler)
+        if(r.type == DescriptorType::Sampler && !descriptorHeap)
         {
           ret[dst].type = DescriptorType::Sampler;
         }
@@ -2711,7 +2734,9 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
         }
         else
         {
-          uint32_t size = m_pDriver->DescriptorDataSize(MakeVkDescriptorType(r.type, false));
+          uint32_t size = descriptorHeap
+                              ? m_pDriver->DescriptorHeapDataSize(r.type)
+                              : m_pDriver->DescriptorDataSize(MakeVkDescriptorType(r.type, false));
           // should not be larger, only smaller with mutable descriptors
           RDCASSERT(size <= r.descriptorSize);
           m_pDriver->LookupDescriptor(descriptor, size, r.type, tmp);
@@ -2827,12 +2852,16 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
     return ret;
   }
 
-  // check for a descriptor buffer
+  // check for a descriptor buffer or descriptor heap
   if(WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
      (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
       (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)) != 0)
+       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+       VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT)) != 0)
   {
+    const bool descriptorHeap =
+        (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
+         VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT) != 0;
     // we assume batched queries, so get the whole descriptor buffer at once
     bytebuf data;
     GetBufferData(descriptorStore, 0, 0, data);
@@ -2856,7 +2885,9 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
         }
         else
         {
-          uint32_t size = m_pDriver->DescriptorDataSize(MakeVkDescriptorType(r.type, false));
+          uint32_t size = descriptorHeap
+                              ? m_pDriver->DescriptorHeapDataSize(r.type)
+                              : m_pDriver->DescriptorDataSize(MakeVkDescriptorType(r.type, false));
           // should not be larger, only smaller with mutable descriptors
           RDCASSERT(size <= r.descriptorSize);
           m_pDriver->LookupDescriptor(descriptor, size, r.type, tmp);
@@ -2950,6 +2981,50 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
   return ret;
 }
 
+static VkSpirvResourceTypeFlagsEXT DescriptorHeapResourceMask(DescriptorType type)
+{
+  switch(type)
+  {
+    case DescriptorType::ConstantBuffer: return VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+    case DescriptorType::Sampler: return VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT;
+    case DescriptorType::ImageSampler:
+      return VK_SPIRV_RESOURCE_TYPE_COMBINED_SAMPLED_IMAGE_BIT_EXT;
+    case DescriptorType::Image:
+    case DescriptorType::TypedBuffer:
+      return VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT |
+             VK_SPIRV_RESOURCE_TYPE_READ_ONLY_IMAGE_BIT_EXT;
+    case DescriptorType::Buffer: return VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT;
+    case DescriptorType::ReadWriteImage:
+    case DescriptorType::ReadWriteTypedBuffer:
+      return VK_SPIRV_RESOURCE_TYPE_READ_WRITE_IMAGE_BIT_EXT;
+    case DescriptorType::ReadWriteBuffer:
+      return VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT;
+    case DescriptorType::AccelerationStructure:
+      return VK_SPIRV_RESOURCE_TYPE_ACCELERATION_STRUCTURE_BIT_EXT;
+    case DescriptorType::Unknown: break;
+  }
+
+  return 0;
+}
+
+static const VulkanCreationInfo::ShaderEntry::DescriptorHeapMapping *FindDescriptorHeapMapping(
+    const VulkanCreationInfo::ShaderEntry &shader, DescriptorType type, uint32_t set,
+    uint32_t binding)
+{
+  const VkSpirvResourceTypeFlagsEXT resourceMask = DescriptorHeapResourceMask(type);
+
+  for(const VulkanCreationInfo::ShaderEntry::DescriptorHeapMapping &mapping :
+      shader.descriptorHeapMappings)
+  {
+    if(mapping.descriptorSet == set && binding >= mapping.firstBinding &&
+       binding - mapping.firstBinding < mapping.bindingCount &&
+       (mapping.resourceMask & resourceMask) != 0)
+      return &mapping;
+  }
+
+  return NULL;
+}
+
 rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
 {
   const VulkanRenderState &state = m_pDriver->m_RenderState;
@@ -2981,6 +3056,147 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
     ret.append(m_pDriver->m_CreationInfo
                    .m_ShaderObject[state.shaderObjects[(uint32_t)ShaderStage::Compute]]
                    .staticDescriptorAccess);
+
+  if(state.descriptorHeapState)
+  {
+    // The shader reflection still uses logical descriptor set/binding declarations, but those
+    // declarations are backed by the heap mappings below. Drop only the conventional descriptor
+    // storage placeholders here, retaining accesses such as specialization constants.
+    ret.removeIf([](const DescriptorAccess &access) {
+      return VulkanCreationInfo::descriptorSetStorage.indexOf(access.descriptorStore) >= 0 ||
+             VulkanCreationInfo::descriptorBufferStorage.indexOf(access.descriptorStore) >= 0 ||
+             VulkanCreationInfo::inlineBufferStorage.indexOf(access.descriptorStore) >= 0;
+    });
+  }
+
+  const VKDynamicShaderFeedback &usage = m_BindlessFeedback[eventId];
+
+  if(state.descriptorHeapState && action)
+  {
+    const VulkanStatePipeline &pipeState = compute ? state.compute : state.graphics;
+
+    auto addHeapBinding = [this, &ret, &state, &usage](
+                              const VulkanCreationInfo::ShaderEntry &shader, DescriptorType type,
+                              uint16_t index, uint32_t set, uint32_t binding, uint32_t arraySize) {
+      const VulkanCreationInfo::ShaderEntry::DescriptorHeapMapping *mapping =
+          FindDescriptorHeapMapping(shader, type, set, binding);
+      if(!mapping)
+        return;
+
+      const VulkanRenderState::DescriptorHeap &heap =
+          type == DescriptorType::Sampler ? state.samplerHeap : state.resourceHeap;
+      if(!heap.bound)
+        return;
+
+      uint64_t mappingOffset = 0;
+      uint64_t arrayStride = 0;
+      switch(mapping->source)
+      {
+        case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT:
+          mappingOffset = mapping->sourceData.constantOffset.heapOffset;
+          arrayStride = mapping->sourceData.constantOffset.heapArrayStride;
+          break;
+        case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT:
+        {
+          const VkDescriptorMappingSourcePushIndexEXT &src = mapping->sourceData.pushIndex;
+          if(src.pushOffset + sizeof(uint32_t) > state.pushData.size())
+            return;
+          uint32_t heapIndex = 0;
+          memcpy(&heapIndex, state.pushData.data() + src.pushOffset, sizeof(heapIndex));
+          mappingOffset = src.heapOffset + uint64_t(heapIndex) * src.heapIndexStride;
+          arrayStride = src.heapArrayStride;
+          break;
+        }
+        default: return;
+      }
+
+      mappingOffset += uint64_t(binding - mapping->firstBinding) * arrayStride;
+
+      // Array bindings are filtered by the instrumented shader when feedback succeeded. An empty
+      // feedback result deliberately means that the shader did not access this binding.
+      if((arraySize > 1 || arraySize == ~0U) && usage.valid)
+        return;
+
+      ResourceId heapBuffer;
+      uint64_t heapBufferOffset = 0;
+      m_pDriver->GetResIDFromAddr(heap.address, heapBuffer, heapBufferOffset);
+      if(heapBuffer == ResourceId())
+        return;
+
+      const uint32_t descriptorSize = m_pDriver->DescriptorHeapDataSize(type);
+      if(descriptorSize == 0)
+        return;
+
+      uint32_t count = RDCMAX(1U, arraySize);
+      if(arraySize == ~0U)
+      {
+        if(arrayStride == 0 || mappingOffset >= heap.size)
+          return;
+        count = uint32_t((heap.size - mappingOffset) / arrayStride);
+      }
+      for(uint32_t arrayElement = 0; arrayElement < count; arrayElement++)
+      {
+        const uint64_t byteOffset =
+            heapBufferOffset + mappingOffset + uint64_t(arrayElement) * arrayStride;
+        if(byteOffset + descriptorSize > heapBufferOffset + heap.size)
+          break;
+
+        DescriptorAccess access;
+        access.stage = shader.stage;
+        access.type = type;
+        access.index = index;
+        access.arrayElement = arrayElement;
+        access.descriptorStore = heapBuffer;
+        access.byteOffset = uint32_t(byteOffset);
+        access.byteSize = descriptorSize;
+        ret.push_back(access);
+      }
+    };
+
+    for(uint32_t stage = 0; stage < NumShaderStages; stage++)
+    {
+      const VulkanCreationInfo::ShaderEntry *shader = NULL;
+      if(pipeState.shaderObject)
+      {
+        const ResourceId shaderId = state.shaderObjects[stage];
+        if(shaderId != ResourceId())
+          shader = &m_pDriver->m_CreationInfo.m_ShaderObject[shaderId].shad;
+      }
+      else if(pipeState.pipeline != ResourceId())
+      {
+        shader = &m_pDriver->m_CreationInfo.m_Pipeline[pipeState.pipeline].shaders[stage];
+      }
+
+      if(!shader || !shader->refl || shader->descriptorHeapMappings.empty())
+        continue;
+
+      for(uint16_t i = 0; i < shader->refl->constantBlocks.size(); i++)
+      {
+        const ConstantBlock &bind = shader->refl->constantBlocks[i];
+        if(bind.bufferBacked)
+          addHeapBinding(*shader, DescriptorType::ConstantBuffer, i, bind.fixedBindSetOrSpace,
+                         bind.fixedBindNumber, bind.bindArraySize);
+      }
+      for(uint16_t i = 0; i < shader->refl->samplers.size(); i++)
+      {
+        const ShaderSampler &bind = shader->refl->samplers[i];
+        addHeapBinding(*shader, DescriptorType::Sampler, i, bind.fixedBindSetOrSpace,
+                       bind.fixedBindNumber, bind.bindArraySize);
+      }
+      for(uint16_t i = 0; i < shader->refl->readOnlyResources.size(); i++)
+      {
+        const ShaderResource &bind = shader->refl->readOnlyResources[i];
+        addHeapBinding(*shader, bind.descriptorType, i, bind.fixedBindSetOrSpace,
+                       bind.fixedBindNumber, bind.bindArraySize);
+      }
+      for(uint16_t i = 0; i < shader->refl->readWriteResources.size(); i++)
+      {
+        const ShaderResource &bind = shader->refl->readWriteResources[i];
+        addHeapBinding(*shader, bind.descriptorType, i, bind.fixedBindSetOrSpace,
+                       bind.fixedBindNumber, bind.bindArraySize);
+      }
+    }
+  }
 
   for(DescriptorAccess &access : ret)
   {
@@ -3063,8 +3279,6 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
       access = DescriptorAccess();
   }
 
-  const VKDynamicShaderFeedback &usage = m_BindlessFeedback[eventId];
-
   if(usage.valid)
     ret.append(usage.access);
 
@@ -3122,7 +3336,8 @@ rdcarray<DescriptorLogicalLocation> VulkanReplay::GetDescriptorLocations(
      (WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
       (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
        (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)) != 0))
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+        VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT)) != 0))
   {
     return ret;
   }

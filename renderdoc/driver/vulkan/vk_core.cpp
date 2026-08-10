@@ -1169,6 +1169,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_DESCRIPTOR_BUFFER_SPEC_VERSION,
     },
     {
+        VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
+        VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION,
+    },
+    {
         VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
         VK_EXT_DESCRIPTOR_INDEXING_SPEC_VERSION,
     },
@@ -2503,6 +2507,46 @@ VkResult WrappedVulkan::FilterDeviceExtensionProperties(VkPhysicalDevice physDev
         }
 
         // if it wasn't supported, remove the extension
+        return true;
+      }
+
+      if(!strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME))
+      {
+        if(instDevInfo->ext_KHR_get_physical_device_properties2)
+        {
+          VkPhysicalDeviceDescriptorHeapFeaturesEXT descFeats = {
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
+          VkPhysicalDeviceFeatures2 baseFeats = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+          baseFeats.pNext = &descFeats;
+          ObjDisp(physDev)->GetPhysicalDeviceFeatures2(Unwrap(physDev), &baseFeats);
+
+          if(!descFeats.descriptorHeapCaptureReplay)
+          {
+            if(!filterWarned)
+              RDCWARN("descriptorHeapCaptureReplay is false, can't support capture of "
+                      "VK_EXT_descriptor_heap");
+            return true;
+          }
+
+          VkPhysicalDeviceDescriptorHeapPropertiesEXT descProps = {
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
+          VkPhysicalDeviceProperties2 baseProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+          baseProps.pNext = &descProps;
+          ObjDisp(physDev)->GetPhysicalDeviceProperties2(Unwrap(physDev), &baseProps);
+
+          if(descProps.samplerDescriptorSize > MaxDescriptorSize ||
+             descProps.imageDescriptorSize > MaxDescriptorSize ||
+             descProps.bufferDescriptorSize > MaxDescriptorSize)
+          {
+            if(!filterWarned)
+              RDCWARN("Descriptor heap descriptor size exceeds RenderDoc's %u-byte limit",
+                      MaxDescriptorSize);
+            return true;
+          }
+
+          return false;
+        }
+
         return true;
       }
 
@@ -5017,6 +5061,20 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
     case VulkanChunk::vkCmdBindDescriptorBufferEmbeddedSamplersEXT:
       return Serialise_vkCmdBindDescriptorBufferEmbeddedSamplersEXT(
           ser, VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_MAX_ENUM, VK_NULL_HANDLE, 0);
+    case VulkanChunk::vkWriteSamplerDescriptorsEXT:
+      return Serialise_vkWriteSamplerDescriptorsEXT(ser, VK_NULL_HANDLE, 0, NULL, NULL);
+    case VulkanChunk::vkWriteResourceDescriptorsEXT:
+      return Serialise_vkWriteResourceDescriptorsEXT(ser, VK_NULL_HANDLE, 0, NULL, NULL);
+    case VulkanChunk::vkCmdBindSamplerHeapEXT:
+      return Serialise_vkCmdBindSamplerHeapEXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdBindResourceHeapEXT:
+      return Serialise_vkCmdBindResourceHeapEXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdPushDataEXT:
+      return Serialise_vkCmdPushDataEXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkRegisterCustomBorderColorEXT:
+      return Serialise_vkRegisterCustomBorderColorEXT(ser, VK_NULL_HANDLE, NULL, VK_FALSE, NULL);
+    case VulkanChunk::vkUnregisterCustomBorderColorEXT:
+      return Serialise_vkUnregisterCustomBorderColorEXT(ser, VK_NULL_HANDLE, 0);
 
     case VulkanChunk::vkCmdBindShadersEXT:
       return Serialise_vkCmdBindShadersEXT(ser, VK_NULL_HANDLE, 0, NULL, NULL);
@@ -6339,6 +6397,25 @@ void WrappedVulkan::AddUsage(VulkanEventNode &eventNode)
     AddFramebufferUsage(eventNode, state);
 
   const VulkanStatePipeline &pipeState = (compute ? state.compute : state.graphics);
+
+  if(state.descriptorHeapState)
+  {
+    for(const VulkanRenderState::DescriptorHeap *heap : {&state.samplerHeap, &state.resourceHeap})
+    {
+      if(!heap->bound)
+        continue;
+      ResourceId id;
+      uint64_t offset = 0;
+      GetResIDFromAddr(heap->address, id, offset);
+      if(id != ResourceId())
+        eventNode.resourceUsage.push_back(make_rdcpair(id, ResourceUsage::All_Resource));
+    }
+
+    // Logical descriptor set/binding declarations are populated by the shader's descriptor heap
+    // mappings, not by state.descSets. The heaps above conservatively represent their resource
+    // usage; do not validate these declarations as conventional bound descriptor sets.
+    return;
+  }
 
   //////////////////////////////
   // Shaders

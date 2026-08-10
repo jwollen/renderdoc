@@ -242,6 +242,17 @@ struct VulkanCreationInfo
 
   struct ShaderEntry
   {
+    struct DescriptorHeapMapping
+    {
+      uint32_t descriptorSet = 0;
+      uint32_t firstBinding = 0;
+      uint32_t bindingCount = 0;
+      VkSpirvResourceTypeFlagsEXT resourceMask = 0;
+      VkDescriptorMappingSourceEXT source = VK_DESCRIPTOR_MAPPING_SOURCE_MAX_ENUM_EXT;
+      VkDescriptorMappingSourceDataEXT sourceData = {};
+      bool embeddedSampler = false;
+    };
+
     ResourceId module;
     ShaderStage stage = ShaderStage::Count;
     rdcstr entryPoint;
@@ -251,6 +262,7 @@ struct VulkanCreationInfo
     VkPipelineShaderStageCreateFlags flags;
 
     rdcarray<SpecConstant> specialization;
+    rdcarray<DescriptorHeapMapping> descriptorHeapMappings;
 
     // VkPipelineShaderStageRequiredSubgroupSizeCreateInfo
     uint32_t requiredSubgroupSize = 0;

@@ -634,6 +634,8 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
 
   static VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSubgroupSize[NumShaderStages] = {};
   static VkPipelineRobustnessCreateInfo shaderRobustness[NumShaderStages] = {};
+  static VkShaderDescriptorSetAndBindingMappingInfoEXT heapMappingInfo[NumShaderStages] = {};
+  static rdcarray<VkDescriptorSetAndBindingMappingEXT> heapMappings[NumShaderStages];
 
   // reserve space for spec constants
   for(uint32_t i = 0; i < NumShaderStages; i++)
@@ -647,6 +649,31 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
       stages[stageCount].pNext = NULL;
       stages[stageCount].pSpecializationInfo = NULL;
       stages[stageCount].flags = pipeInfo.shaders[i].flags;
+
+      heapMappings[i].resize(pipeInfo.shaders[i].descriptorHeapMappings.size());
+      for(size_t m = 0; m < heapMappings[i].size(); m++)
+      {
+        const VulkanCreationInfo::ShaderEntry::DescriptorHeapMapping &src =
+            pipeInfo.shaders[i].descriptorHeapMappings[m];
+        VkDescriptorSetAndBindingMappingEXT &dst = heapMappings[i][m];
+        dst = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
+        dst.descriptorSet = src.descriptorSet;
+        dst.firstBinding = src.firstBinding;
+        dst.bindingCount = src.bindingCount;
+        dst.resourceMask = src.resourceMask;
+        dst.source = src.source;
+        dst.sourceData = src.sourceData;
+      }
+
+      if(!heapMappings[i].empty())
+      {
+        heapMappingInfo[i] = {
+            VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT};
+        heapMappingInfo[i].mappingCount = (uint32_t)heapMappings[i].size();
+        heapMappingInfo[i].pMappings = heapMappings[i].data();
+        heapMappingInfo[i].pNext = stages[stageCount].pNext;
+        stages[stageCount].pNext = &heapMappingInfo[i];
+      }
 
       if(pipeInfo.shaders[i].requiredSubgroupSize != 0)
       {
@@ -1138,7 +1165,9 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
       VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
   };
 
-  if(pipeInfo.useCreateFlags2 && m_pDriver->Maintenance5())
+  if(pipeInfo.useCreateFlags2 &&
+     (m_pDriver->Maintenance5() ||
+      m_pDriver->GetExtensions(GetRecord(m_Device)).ext_EXT_descriptor_heap))
   {
     createFlags.flags = flags;
 
@@ -1214,6 +1243,32 @@ void VulkanShaderCache::MakeComputePipelineInfo(VkComputePipelineCreateInfo &pip
   stage.pSpecializationInfo = NULL;
   stage.flags = pipeInfo.shaders[i].flags;
 
+  static VkShaderDescriptorSetAndBindingMappingInfoEXT heapMappingInfo = {
+      VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT};
+  static rdcarray<VkDescriptorSetAndBindingMappingEXT> heapMappings;
+  heapMappings.resize(pipeInfo.shaders[i].descriptorHeapMappings.size());
+  for(size_t m = 0; m < heapMappings.size(); m++)
+  {
+    const VulkanCreationInfo::ShaderEntry::DescriptorHeapMapping &src =
+        pipeInfo.shaders[i].descriptorHeapMappings[m];
+    VkDescriptorSetAndBindingMappingEXT &dst = heapMappings[m];
+    dst = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
+    dst.descriptorSet = src.descriptorSet;
+    dst.firstBinding = src.firstBinding;
+    dst.bindingCount = src.bindingCount;
+    dst.resourceMask = src.resourceMask;
+    dst.source = src.source;
+    dst.sourceData = src.sourceData;
+  }
+
+  if(!heapMappings.empty())
+  {
+    heapMappingInfo.mappingCount = (uint32_t)heapMappings.size();
+    heapMappingInfo.pMappings = heapMappings.data();
+    heapMappingInfo.pNext = stage.pNext;
+    stage.pNext = &heapMappingInfo;
+  }
+
   uint32_t dataOffset = 0;
 
   if(!pipeInfo.shaders[i].specialization.empty())
@@ -1279,7 +1334,9 @@ void VulkanShaderCache::MakeComputePipelineInfo(VkComputePipelineCreateInfo &pip
       VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
   };
 
-  if(pipeInfo.useCreateFlags2 && m_pDriver->Maintenance5())
+  if(pipeInfo.useCreateFlags2 &&
+     (m_pDriver->Maintenance5() ||
+      m_pDriver->GetExtensions(GetRecord(m_Device)).ext_EXT_descriptor_heap))
   {
     createFlags.flags = flags;
 

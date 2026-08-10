@@ -1101,6 +1101,56 @@ static void ProcessStaticDescriptorAccess(VulkanResourceManager *resourceMan,
   }
 }
 
+static void InitDescriptorHeapMappings(VulkanCreationInfo::ShaderEntry &shad,
+                                       const VkBaseInStructure *createInfo)
+{
+  const VkShaderDescriptorSetAndBindingMappingInfoEXT *mappingInfo =
+      (const VkShaderDescriptorSetAndBindingMappingInfoEXT *)FindNextStruct(
+          createInfo, VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT);
+
+  if(!mappingInfo)
+    return;
+
+  shad.descriptorHeapMappings.resize(mappingInfo->mappingCount);
+  for(uint32_t i = 0; i < mappingInfo->mappingCount; i++)
+  {
+    const VkDescriptorSetAndBindingMappingEXT &src = mappingInfo->pMappings[i];
+    VulkanCreationInfo::ShaderEntry::DescriptorHeapMapping &dst =
+        shad.descriptorHeapMappings[i];
+    dst.descriptorSet = src.descriptorSet;
+    dst.firstBinding = src.firstBinding;
+    dst.bindingCount = src.bindingCount;
+    dst.resourceMask = src.resourceMask;
+    dst.source = src.source;
+    dst.sourceData = src.sourceData;
+
+    switch(src.source)
+    {
+      case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT:
+        dst.embeddedSampler = src.sourceData.constantOffset.pEmbeddedSampler != NULL;
+        dst.sourceData.constantOffset.pEmbeddedSampler = NULL;
+        break;
+      case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT:
+        dst.embeddedSampler = src.sourceData.pushIndex.pEmbeddedSampler != NULL;
+        dst.sourceData.pushIndex.pEmbeddedSampler = NULL;
+        break;
+      case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT:
+        dst.embeddedSampler = src.sourceData.indirectIndex.pEmbeddedSampler != NULL;
+        dst.sourceData.indirectIndex.pEmbeddedSampler = NULL;
+        break;
+      case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_ARRAY_EXT:
+        dst.embeddedSampler = src.sourceData.indirectIndexArray.pEmbeddedSampler != NULL;
+        dst.sourceData.indirectIndexArray.pEmbeddedSampler = NULL;
+        break;
+      case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_SHADER_RECORD_INDEX_EXT:
+        dst.embeddedSampler = src.sourceData.shaderRecordIndex.pEmbeddedSampler != NULL;
+        dst.sourceData.shaderRecordIndex.pEmbeddedSampler = NULL;
+        break;
+      default: break;
+    }
+  }
+}
+
 void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
                                             VulkanCreationInfo &info, ResourceId id,
                                             const VkShaderCreateInfoEXT *pCreateInfo)
@@ -1127,6 +1177,7 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   info.m_ShaderModule[id].Init(resourceMan, info, &smInfo);
 
   shad.entryPoint = pCreateInfo->pName;
+  InitDescriptorHeapMappings(shad, (const VkBaseInStructure *)pCreateInfo);
 
   // descriptor set layouts
   if(pCreateInfo->pSetLayouts)
@@ -1339,6 +1390,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     shad.entryPoint = pCreateInfo->pStages[i].pName;
     shad.stage = ShaderStage(stageIndex);
     shad.flags = pCreateInfo->pStages[i].flags;
+    InitDescriptorHeapMappings(shad, (const VkBaseInStructure *)&pCreateInfo->pStages[i]);
 
     ShaderModuleReflectionKey key(shad.stage, shad.entryPoint, ResourceId());
 
@@ -2019,6 +2071,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
     shad.entryPoint = pCreateInfo->stage.pName;
     shad.stage = ShaderStage::Compute;
     shad.flags = pCreateInfo->stage.flags;
+    InitDescriptorHeapMappings(shad, (const VkBaseInStructure *)&pCreateInfo->stage);
 
     ShaderModuleReflectionKey key(ShaderStage::Compute, shad.entryPoint, ResourceId());
 

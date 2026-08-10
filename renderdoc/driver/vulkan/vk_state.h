@@ -112,6 +112,7 @@ struct VulkanRenderState
   void BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd, PipelineBinding binding, bool subpass0);
 
   void BindDescriptorBuffers(WrappedVulkan *vk, VkCommandBuffer cmd);
+  void BindDescriptorHeaps(WrappedVulkan *vk, VkCommandBuffer cmd);
 
   void BindShaderObjects(WrappedVulkan *vk, VkCommandBuffer cmd, PipelineBinding binding);
   void BindDynamicState(WrappedVulkan *vk, VkCommandBuffer cmd);
@@ -181,6 +182,43 @@ struct VulkanRenderState
   // partial/temporarily invalid state like if we are resetting state after a discard pattern and
   // the command buffer has only pushed some constants but not yet bound a pipeline
   ResourceId pushLayout;
+
+  // VK_EXT_descriptor_heap state is global to the command buffer rather than per bind point.
+  struct DescriptorHeap
+  {
+    bool bound = false;
+    VkDeviceAddress address = 0;
+    VkDeviceSize size = 0;
+    VkDeviceSize reservedOffset = 0;
+    VkDeviceSize reservedSize = 0;
+
+    void reset() { *this = DescriptorHeap(); }
+  } samplerHeap, resourceHeap;
+
+  bytebuf pushData;
+  bool descriptorHeapState = false;
+
+  void InvalidateDescriptorHeapState()
+  {
+    samplerHeap.reset();
+    resourceHeap.reset();
+    pushData.clear();
+    descriptorHeapState = false;
+  }
+
+  void InvalidateNonHeapDescriptorState()
+  {
+    descBufs.clear();
+    pushConstSize = 0;
+    pushLayout = ResourceId();
+
+    for(VulkanStatePipeline *pipe : {&graphics, &compute, &rt})
+    {
+      pipe->descSets.clear();
+      pipe->lastBoundDescSet = -1;
+      pipe->lastBoundDescBufSet = -1;
+    }
+  }
 
   uint32_t subpass = 0;
   VkSubpassContents subpassContents;

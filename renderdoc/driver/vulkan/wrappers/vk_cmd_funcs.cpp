@@ -1589,6 +1589,37 @@ bool WrappedVulkan::Serialise_vkBeginCommandBuffer(SerialiserType &ser, VkComman
       if(inheritanceConditionalRenderingInfo)
         m_BakedCmdBufferInfo[BakedCommandBuffer].inheritConditionalRendering =
             inheritanceConditionalRenderingInfo->conditionalRenderingEnable == VK_TRUE;
+
+      const VkCommandBufferInheritanceDescriptorHeapInfoEXT *inheritanceDescriptorHeapInfo =
+          (const VkCommandBufferInheritanceDescriptorHeapInfoEXT *)FindNextStruct(
+              BeginInfo.pInheritanceInfo,
+              VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT);
+      if(inheritanceDescriptorHeapInfo)
+      {
+        VulkanRenderState &state = m_BakedCmdBufferInfo[BakedCommandBuffer].state;
+        state.InvalidateNonHeapDescriptorState();
+        state.descriptorHeapState = true;
+
+        if(inheritanceDescriptorHeapInfo->pSamplerHeapBindInfo)
+        {
+          const VkBindHeapInfoEXT &bind = *inheritanceDescriptorHeapInfo->pSamplerHeapBindInfo;
+          state.samplerHeap.bound = true;
+          state.samplerHeap.address = bind.heapRange.address;
+          state.samplerHeap.size = bind.heapRange.size;
+          state.samplerHeap.reservedOffset = bind.reservedRangeOffset;
+          state.samplerHeap.reservedSize = bind.reservedRangeSize;
+        }
+
+        if(inheritanceDescriptorHeapInfo->pResourceHeapBindInfo)
+        {
+          const VkBindHeapInfoEXT &bind = *inheritanceDescriptorHeapInfo->pResourceHeapBindInfo;
+          state.resourceHeap.bound = true;
+          state.resourceHeap.address = bind.heapRange.address;
+          state.resourceHeap.size = bind.heapRange.size;
+          state.resourceHeap.reservedOffset = bind.reservedRangeOffset;
+          state.resourceHeap.reservedSize = bind.reservedRangeSize;
+        }
+      }
     }
 
     byte *tempMem = GetTempMemory(GetNextPatchSize(unwrappedBeginInfo.pNext));
@@ -3825,6 +3856,16 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorSets(
     if(IsActiveReplaying(m_State))
     {
       if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+    {
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+    }
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
       {
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
 
@@ -3964,6 +4005,16 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorSets2(
   if(IsReplayingAndReading())
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+    {
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+    }
 
     byte *tempMem = GetTempMemory(GetNextPatchSize(&BindDescriptorSetsInfo));
     VkBindDescriptorSetsInfo *unwrappedInfo =
@@ -4413,6 +4464,16 @@ bool WrappedVulkan::Serialise_vkCmdPushConstants(SerialiserType &ser, VkCommandB
     if(IsActiveReplaying(m_State))
     {
       if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+    {
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+    }
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
       {
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
         ObjDisp(commandBuffer)
@@ -4481,6 +4542,16 @@ bool WrappedVulkan::Serialise_vkCmdPushConstants2(SerialiserType &ser, VkCommand
   if(IsReplayingAndReading())
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+    {
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+    }
 
     byte *tempMem = GetTempMemory(GetNextPatchSize(&PushConstantsInfo));
     VkPushConstantsInfo *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, &PushConstantsInfo);
@@ -6114,6 +6185,14 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSet(SerialiserType &ser,
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
 
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+
     ResourceId setId =
         m_BakedCmdBufferInfo[m_LastCmdBufferID].GetPushDescriptorID(pipelineBindPoint, set);
 
@@ -6405,6 +6484,14 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetWithTemplate(
   if(IsReplayingAndReading())
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
 
     VkPipelineBindPoint bindPoint =
         m_CreationInfo.m_DescUpdateTemplate[GetResID(descriptorUpdateTemplate)].bindPoint;
@@ -9334,6 +9421,16 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorBuffersEXT(
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
 
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+    {
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+    }
+
     size_t memSize = 0;
     for(uint32_t b = 0; b < bufferCount; b++)
       memSize += GetNextPatchSize(&pBindingInfos[b]);
@@ -9491,6 +9588,16 @@ bool WrappedVulkan::Serialise_vkCmdSetDescriptorBufferOffsetsEXT(
     if(IsActiveReplaying(m_State))
     {
       if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+    {
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+    }
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
       {
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
         ObjDisp(commandBuffer)
@@ -9627,6 +9734,16 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorBufferEmbeddedSamplersEXT(
     if(IsActiveReplaying(m_State))
     {
       if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+    {
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+    }
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
       {
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
         ObjDisp(commandBuffer)
@@ -9712,6 +9829,14 @@ bool WrappedVulkan::Serialise_vkCmdSetDescriptorBufferOffsets2EXT(
   if(IsReplayingAndReading())
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
 
     byte *tempMem = GetTempMemory(GetNextPatchSize(&SetDescriptorBufferOffsetsInfo));
     VkSetDescriptorBufferOffsetsInfoEXT *unwrappedInfo =
@@ -9862,6 +9987,14 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorBufferEmbeddedSamplers2EXT(
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
 
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
+
     byte *tempMem = GetTempMemory(GetNextPatchSize(&BindDescriptorBufferEmbeddedSamplersInfo));
     VkBindDescriptorBufferEmbeddedSamplersInfoEXT *unwrappedInfo =
         UnwrapStructAndChain(m_State, tempMem, &BindDescriptorBufferEmbeddedSamplersInfo);
@@ -9964,6 +10097,14 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSet2(
   if(IsReplayingAndReading())
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
 
     rdcarray<VkPipelineBindPoint> pipelinesAffected =
         PipelinesForStageMask(PushDescriptorSetInfo.stageFlags);
@@ -10142,6 +10283,14 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetWithTemplate2(
   if(IsReplayingAndReading())
   {
     m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        GetCmdRenderState().InvalidateDescriptorHeapState();
+    }
+    else
+      m_BakedCmdBufferInfo[m_LastCmdBufferID].state.InvalidateDescriptorHeapState();
 
     uint32_t set = PushDescriptorSetWithTemplateInfo.set;
 

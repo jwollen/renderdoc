@@ -42,6 +42,28 @@ uint32_t WrappedVulkan::DescriptorDataSize(VkDescriptorType type)
   return ::DescriptorDataSize(m_DescriptorBufferProperties, type);
 }
 
+uint32_t WrappedVulkan::DescriptorHeapDataSize(DescriptorType type) const
+{
+  switch(type)
+  {
+    case DescriptorType::Sampler: return uint32_t(m_DescriptorHeapProperties.samplerDescriptorSize);
+    case DescriptorType::ImageSampler:
+    case DescriptorType::Image:
+    case DescriptorType::TypedBuffer:
+    case DescriptorType::ReadWriteImage:
+    case DescriptorType::ReadWriteTypedBuffer:
+      return uint32_t(m_DescriptorHeapProperties.imageDescriptorSize);
+    case DescriptorType::ConstantBuffer:
+    case DescriptorType::Buffer:
+    case DescriptorType::ReadWriteBuffer:
+    case DescriptorType::AccelerationStructure:
+      return uint32_t(m_DescriptorHeapProperties.bufferDescriptorSize);
+    case DescriptorType::Unknown: break;
+  }
+
+  return 0;
+}
+
 void WrappedVulkan::EstimateDescriptorFormats()
 {
   // we want to differentiate the descriptor in as few tests as possible. We don't necessarily care
@@ -632,6 +654,12 @@ BufferDescriptorFormat WrappedVulkan::EstimateBufferDescriptor(VkDescriptorType 
 void WrappedVulkan::LookupDescriptor(byte *descriptorBytes, size_t descriptorSize,
                                      DescriptorType type, DescriptorSetSlot &data)
 {
+  if(m_DescriptorLookup.exactOnly.contains({descriptorBytes, descriptorSize}))
+  {
+    data = m_DescriptorLookup.exactOnly.lookup({descriptorBytes, descriptorSize});
+    return;
+  }
+
   const size_t combinedSize = m_DescriptorBufferProperties.combinedImageSamplerDescriptorSize;
   const size_t sampledSize = m_DescriptorBufferProperties.sampledImageDescriptorSize;
   const size_t samplerSize = m_DescriptorBufferProperties.samplerDescriptorSize;
@@ -1311,9 +1339,19 @@ void WrappedVulkan::GetFinalBufferParameters(byte *descriptorBytes, size_t descr
   }
 }
 
-void WrappedVulkan::RegisterDescriptor(const bytebuf &key, const DescriptorSetSlot &data)
+void WrappedVulkan::RegisterDescriptor(const bytebuf &key, const DescriptorSetSlot &data,
+                                       bool fastLookup)
 {
   m_DescriptorLookup.fallback.insert(key, data);
+
+  // Inline descriptor heap create infos don't correspond to live VkSampler/VkImageView objects.
+  // They can be decoded exactly from the fallback table, but must not enter the fast lookup tables
+  // whose successful paths validate by unwrapping and regenerating a descriptor from a live object.
+  if(!fastLookup)
+  {
+    m_DescriptorLookup.exactOnly.insert(key, data);
+    return;
+  }
 
   // only register NULL patterns for non-sampler types
   if(data.type != DescriptorSlotType::Sampler &&
@@ -3696,3 +3734,681 @@ INSTANTIATE_FUNCTION_SERIALISED(void, vkUpdateDescriptorSetWithTemplate, VkDevic
 INSTANTIATE_FUNCTION_SERIALISED(void, vkGetDescriptorEXT, VkDevice device,
                                 const VkDescriptorGetInfoEXT *pDescriptorInfo, size_t dataSize,
                                 void *pDescriptor);
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCmdBindSamplerHeapEXT(SerialiserType &ser,
+                                                       VkCommandBuffer commandBuffer,
+                                                       const VkBindHeapInfoEXT *pBindInfo)
+{
+  SERIALISE_ELEMENT(commandBuffer);
+  SERIALISE_ELEMENT_LOCAL(BindInfo, *pBindInfo).Important();
+  Serialise_DebugMessages(ser);
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    m_LastCmdBufferID = GetResID(commandBuffer);
+    VkCommandBuffer replayCmd = commandBuffer;
+    VulkanRenderState *state = &m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
+    bool execute = !IsActiveReplaying(m_State);
+    if(IsActiveReplaying(m_State) && InRerecordRange(m_LastCmdBufferID))
+    {
+      replayCmd = RerecordCmdBuf(m_LastCmdBufferID);
+      state = &GetCmdRenderState();
+      execute = true;
+    }
+
+    if(execute)
+    {
+      ObjDisp(replayCmd)->CmdBindSamplerHeapEXT(Unwrap(replayCmd), &BindInfo);
+
+      state->InvalidateNonHeapDescriptorState();
+      state->descriptorHeapState = true;
+      state->samplerHeap.bound = true;
+      state->samplerHeap.address = BindInfo.heapRange.address;
+      state->samplerHeap.size = BindInfo.heapRange.size;
+      state->samplerHeap.reservedOffset = BindInfo.reservedRangeOffset;
+      state->samplerHeap.reservedSize = BindInfo.reservedRangeSize;
+    }
+  }
+  return true;
+}
+
+void WrappedVulkan::vkCmdBindSamplerHeapEXT(VkCommandBuffer commandBuffer,
+                                             const VkBindHeapInfoEXT *pBindInfo)
+{
+  SCOPED_DBG_SINK();
+  SERIALISE_TIME_CALL(ObjDisp(commandBuffer)->CmdBindSamplerHeapEXT(Unwrap(commandBuffer), pBindInfo));
+  if(IsCaptureMode(m_State))
+  {
+    VkResourceRecord *record = GetRecord(commandBuffer);
+    CACHE_THREAD_SERIALISER();
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCmdBindSamplerHeapEXT);
+    Serialise_vkCmdBindSamplerHeapEXT(ser, commandBuffer, pBindInfo);
+    record->AddChunk(scope.Get(&record->cmdInfo->alloc));
+
+    ResourceId heap;
+    uint64_t offset = 0;
+    GetResIDFromAddr(pBindInfo->heapRange.address, heap, offset);
+    VkResourceRecord *heapRecord = GetResourceManager()->GetResourceRecord(heap);
+    if(heapRecord)
+      record->MarkBufferFrameReferenced(heapRecord, offset, pBindInfo->heapRange.size,
+                                        eFrameRef_Read);
+  }
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkWriteSamplerDescriptorsEXT(
+    SerialiserType &ser, VkDevice device, uint32_t samplerCount,
+    const VkSamplerCreateInfo *pSamplers, const VkHostAddressRangeEXT *pDescriptors)
+{
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT(samplerCount);
+  SERIALISE_ELEMENT_ARRAY(pSamplers, samplerCount).Important();
+
+  rdcarray<uint64_t> descriptorSizes;
+  descriptorSizes.resize(samplerCount);
+  if(ser.IsWriting())
+    for(uint32_t i = 0; i < samplerCount; i++)
+      descriptorSizes[i] = pDescriptors[i].size;
+  SERIALISE_ELEMENT(descriptorSizes);
+
+  rdcarray<bytebuf> descriptorData;
+  descriptorData.resize(samplerCount);
+  for(uint32_t i = 0; i < samplerCount; i++)
+  {
+    byte *DescriptorBytes =
+        ser.IsWriting() ? (byte *)pDescriptors[i].address : NULL;
+    SERIALISE_ELEMENT_ARRAY(DescriptorBytes, descriptorSizes[i]).Important();
+    if(ser.IsReading())
+      descriptorData[i].assign(DescriptorBytes, descriptorSizes[i]);
+    else
+      descriptorData[i].assign((const byte *)pDescriptors[i].address, descriptorSizes[i]);
+  }
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    size_t memSize = sizeof(VkSamplerCreateInfo) * samplerCount;
+    for(uint32_t i = 0; i < samplerCount; i++)
+      memSize += GetNextPatchSize(&pSamplers[i]);
+    byte *mem = GetTempMemory(memSize);
+    VkSamplerCreateInfo *unwrapped = (VkSamplerCreateInfo *)mem;
+    mem = (byte *)(unwrapped + samplerCount);
+    for(uint32_t i = 0; i < samplerCount; i++)
+      unwrapped[i] = *UnwrapStructAndChain(m_State, mem, &pSamplers[i]);
+
+    rdcarray<bytebuf> replayData;
+    rdcarray<VkHostAddressRangeEXT> ranges;
+    replayData.resize(samplerCount);
+    ranges.resize(samplerCount);
+    for(uint32_t i = 0; i < samplerCount; i++)
+    {
+      replayData[i].resize(descriptorData[i].size());
+      ranges[i] = {replayData[i].data(), replayData[i].size()};
+    }
+
+    VkResult vkr = ObjDisp(device)->WriteSamplerDescriptorsEXT(
+        Unwrap(device), samplerCount, unwrapped, ranges.data());
+    if(vkr != VK_SUCCESS)
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "vkWriteSamplerDescriptorsEXT failed on replay: %s", ToStr(vkr).c_str());
+      return false;
+    }
+
+    for(uint32_t i = 0; i < samplerCount; i++)
+    {
+      if(replayData[i] != descriptorData[i])
+      {
+        SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                         "Sampler descriptor %u changed bit pattern between capture and replay.\n\n%s",
+                         i, GetPhysDeviceCompatString(false, false).c_str());
+        return false;
+      }
+
+      // Unlike vkGetDescriptorEXT these descriptors are made directly from create infos, so there
+      // is no VkSampler object whose creation info we can look up. Keep a synthetic sampler entry
+      // associated with the generated bytes so descriptor heap contents can still be decoded for
+      // pipeline state display.
+      ResourceId sampler = ResourceIDGen::GetNewUniqueID();
+      m_CreationInfo.m_Sampler[sampler].Init(GetResourceManager(), m_CreationInfo, &pSamplers[i]);
+      AddResource(sampler, ResourceType::Sampler, "Inline Sampler");
+
+      DescriptorSetSlot descriptor = {};
+      descriptor.SetSampler(sampler);
+      RegisterDescriptor(replayData[i], descriptor, false);
+    }
+  }
+
+  return true;
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkWriteResourceDescriptorsEXT(
+    SerialiserType &ser, VkDevice device, uint32_t resourceCount,
+    const VkResourceDescriptorInfoEXT *pResources, const VkHostAddressRangeEXT *pDescriptors)
+{
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT(resourceCount);
+  SERIALISE_ELEMENT_ARRAY(pResources, resourceCount).Important();
+
+  rdcarray<uint64_t> descriptorSizes;
+  descriptorSizes.resize(resourceCount);
+  if(ser.IsWriting())
+    for(uint32_t i = 0; i < resourceCount; i++)
+      descriptorSizes[i] = pDescriptors[i].size;
+  SERIALISE_ELEMENT(descriptorSizes);
+
+  rdcarray<bytebuf> descriptorData;
+  descriptorData.resize(resourceCount);
+  for(uint32_t i = 0; i < resourceCount; i++)
+  {
+    byte *DescriptorBytes =
+        ser.IsWriting() ? (byte *)pDescriptors[i].address : NULL;
+    SERIALISE_ELEMENT_ARRAY(DescriptorBytes, descriptorSizes[i]).Important();
+    if(ser.IsReading())
+      descriptorData[i].assign(DescriptorBytes, descriptorSizes[i]);
+    else
+      descriptorData[i].assign((const byte *)pDescriptors[i].address, descriptorSizes[i]);
+  }
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    rdcarray<VkResourceDescriptorInfoEXT> unwrapped;
+    rdcarray<VkImageDescriptorInfoEXT> images;
+    rdcarray<VkImageViewCreateInfo> views;
+    unwrapped.resize(resourceCount);
+    images.resize(resourceCount);
+    views.resize(resourceCount);
+    size_t viewMemSize = 0;
+    for(uint32_t i = 0; i < resourceCount; i++)
+      if((pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM) &&
+         pResources[i].data.pImage && pResources[i].data.pImage->pView)
+        viewMemSize += GetNextPatchSize(pResources[i].data.pImage->pView);
+    byte *viewMem = GetTempMemory(viewMemSize);
+    for(uint32_t i = 0; i < resourceCount; i++)
+    {
+      unwrapped[i] = pResources[i];
+      if((pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM) &&
+         pResources[i].data.pImage)
+      {
+        images[i] = *pResources[i].data.pImage;
+        if(images[i].pView)
+        {
+          views[i] = *UnwrapStructAndChain(m_State, viewMem, images[i].pView);
+          images[i].pView = &views[i];
+        }
+        unwrapped[i].data.pImage = &images[i];
+      }
+    }
+
+    rdcarray<bytebuf> replayData;
+    rdcarray<VkHostAddressRangeEXT> ranges;
+    replayData.resize(resourceCount);
+    ranges.resize(resourceCount);
+    for(uint32_t i = 0; i < resourceCount; i++)
+    {
+      replayData[i].resize(descriptorData[i].size());
+      ranges[i] = {replayData[i].data(), replayData[i].size()};
+    }
+
+    VkResult vkr = ObjDisp(device)->WriteResourceDescriptorsEXT(
+        Unwrap(device), resourceCount, unwrapped.data(), ranges.data());
+    if(vkr != VK_SUCCESS)
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "vkWriteResourceDescriptorsEXT failed on replay: %s", ToStr(vkr).c_str());
+      return false;
+    }
+
+    for(uint32_t i = 0; i < resourceCount; i++)
+    {
+      if(replayData[i] != descriptorData[i])
+      {
+        SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                         "Resource descriptor %u changed bit pattern between capture and replay.\n\n%s",
+                         i, GetPhysDeviceCompatString(false, false).c_str());
+        return false;
+      }
+
+      VkDescriptorGetInfoEXT getInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
+      VkDescriptorAddressInfoEXT addressInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};
+      getInfo.type = pResources[i].type;
+
+      if((pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM) &&
+         pResources[i].data.pImage)
+      {
+        ResourceId view;
+        if(pResources[i].data.pImage->pView)
+        {
+          // Heap image descriptors also contain an inline view create info instead of referencing
+          // a VkImageView. Preserve it under a synthetic ID for FillDescriptor().
+          view = ResourceIDGen::GetNewUniqueID();
+          m_CreationInfo.m_ImageView[view].Init(GetResourceManager(), m_CreationInfo,
+                                                pResources[i].data.pImage->pView);
+        }
+
+        DescriptorSetSlot descriptor = {};
+        descriptor.SetImageSampler(pResources[i].type, view, ResourceId(),
+                                   pResources[i].data.pImage->layout);
+        RegisterDescriptor(replayData[i], descriptor, false);
+        continue;
+      }
+      else if((pResources[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+          pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) &&
+         pResources[i].data.pTexelBuffer)
+      {
+        addressInfo.address = pResources[i].data.pTexelBuffer->addressRange.address;
+        addressInfo.range = pResources[i].data.pTexelBuffer->addressRange.size;
+        addressInfo.format = pResources[i].data.pTexelBuffer->format;
+        getInfo.data.pUniformTexelBuffer = &addressInfo;
+      }
+      else if((pResources[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+               pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) &&
+              pResources[i].data.pAddressRange)
+      {
+        addressInfo.address = pResources[i].data.pAddressRange->address;
+        addressInfo.range = pResources[i].data.pAddressRange->size;
+        getInfo.data.pUniformBuffer = &addressInfo;
+      }
+      else if(pResources[i].type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
+              pResources[i].data.pAddressRange)
+      {
+        getInfo.data.accelerationStructure = pResources[i].data.pAddressRange->address;
+      }
+      else
+      {
+        continue;
+      }
+
+      DescriptorSetSlot descriptor = {};
+      descriptor.SetDescriptor(this, getInfo);
+      RegisterDescriptor(replayData[i], descriptor);
+    }
+  }
+
+  return true;
+}
+
+VkResult WrappedVulkan::vkWriteSamplerDescriptorsEXT(
+    VkDevice device, uint32_t samplerCount, const VkSamplerCreateInfo *pSamplers,
+    const VkHostAddressRangeEXT *pDescriptors)
+{
+  size_t memSize = sizeof(VkSamplerCreateInfo) * samplerCount;
+  for(uint32_t i = 0; i < samplerCount; i++)
+    memSize += GetNextPatchSize(&pSamplers[i]);
+  byte *mem = GetTempMemory(memSize);
+  VkSamplerCreateInfo *unwrapped = (VkSamplerCreateInfo *)mem;
+  mem = (byte *)(unwrapped + samplerCount);
+  for(uint32_t i = 0; i < samplerCount; i++)
+    unwrapped[i] = *UnwrapStructAndChain(m_State, mem, &pSamplers[i]);
+
+  rdcarray<bytebuf> data;
+  rdcarray<VkHostAddressRangeEXT> ranges;
+  data.resize(samplerCount);
+  ranges.resize(samplerCount);
+  for(uint32_t i = 0; i < samplerCount; i++)
+  {
+    data[i].resize(pDescriptors[i].size);
+    ranges[i] = {data[i].data(), data[i].size()};
+  }
+  VkResult ret = ObjDisp(device)->WriteSamplerDescriptorsEXT(Unwrap(device), samplerCount,
+                                                             unwrapped, ranges.data());
+  if(ret == VK_SUCCESS)
+  {
+    for(uint32_t i = 0; i < samplerCount; i++)
+      memcpy(pDescriptors[i].address, data[i].data(), data[i].size());
+    if(IsCaptureMode(m_State))
+    {
+      CACHE_THREAD_SERIALISER();
+      SCOPED_SERIALISE_CHUNK(VulkanChunk::vkWriteSamplerDescriptorsEXT);
+      Serialise_vkWriteSamplerDescriptorsEXT(ser, device, samplerCount, pSamplers, ranges.data());
+
+      VkResourceRecord *record = NULL;
+      for(uint32_t i = 0; i < samplerCount; i++)
+      {
+        const VkSamplerYcbcrConversionInfo *ycbcr =
+            (const VkSamplerYcbcrConversionInfo *)FindNextStruct(
+                &pSamplers[i], VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO);
+        if(ycbcr && ycbcr->conversion != VK_NULL_HANDLE)
+        {
+          VkResourceRecord *conversionRecord = GetRecord(ycbcr->conversion);
+          if(record)
+            record->AddParent(conversionRecord);
+          else
+            record = conversionRecord;
+        }
+      }
+      if(!record)
+        record = GetRecord(device);
+      record->AddChunk(scope.Get());
+    }
+  }
+  return ret;
+}
+
+VkResult WrappedVulkan::vkWriteResourceDescriptorsEXT(
+    VkDevice device, uint32_t resourceCount, const VkResourceDescriptorInfoEXT *pResources,
+    const VkHostAddressRangeEXT *pDescriptors)
+{
+  rdcarray<VkResourceDescriptorInfoEXT> unwrapped;
+  rdcarray<VkImageDescriptorInfoEXT> images;
+  rdcarray<VkImageViewCreateInfo> views;
+  unwrapped.resize(resourceCount);
+  images.resize(resourceCount);
+  views.resize(resourceCount);
+  size_t viewMemSize = 0;
+  for(uint32_t i = 0; i < resourceCount; i++)
+    if((pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM) &&
+       pResources[i].data.pImage && pResources[i].data.pImage->pView)
+      viewMemSize += GetNextPatchSize(pResources[i].data.pImage->pView);
+  byte *viewMem = GetTempMemory(viewMemSize);
+  for(uint32_t i = 0; i < resourceCount; i++)
+  {
+    unwrapped[i] = pResources[i];
+    if((pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM ||
+        pResources[i].type == VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM) &&
+       pResources[i].data.pImage)
+    {
+      images[i] = *pResources[i].data.pImage;
+      if(images[i].pView)
+      {
+        views[i] = *UnwrapStructAndChain(m_State, viewMem, images[i].pView);
+        images[i].pView = &views[i];
+      }
+      unwrapped[i].data.pImage = &images[i];
+    }
+  }
+  rdcarray<bytebuf> data;
+  rdcarray<VkHostAddressRangeEXT> ranges;
+  data.resize(resourceCount);
+  ranges.resize(resourceCount);
+  for(uint32_t i = 0; i < resourceCount; i++)
+  {
+    data[i].resize(pDescriptors[i].size);
+    ranges[i] = {data[i].data(), data[i].size()};
+  }
+  VkResult ret = ObjDisp(device)->WriteResourceDescriptorsEXT(
+      Unwrap(device), resourceCount, unwrapped.data(), ranges.data());
+  if(ret == VK_SUCCESS)
+  {
+    for(uint32_t i = 0; i < resourceCount; i++)
+      memcpy(pDescriptors[i].address, data[i].data(), data[i].size());
+    if(IsCaptureMode(m_State))
+    {
+      CACHE_THREAD_SERIALISER();
+      SCOPED_SERIALISE_CHUNK(VulkanChunk::vkWriteResourceDescriptorsEXT);
+      Serialise_vkWriteResourceDescriptorsEXT(ser, device, resourceCount, pResources, ranges.data());
+
+      VkResourceRecord *record = NULL;
+      for(uint32_t i = 0; i < resourceCount; i++)
+      {
+        ResourceId id;
+        if((pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+            pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+            pResources[i].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+            pResources[i].type == VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM ||
+            pResources[i].type == VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM) &&
+           pResources[i].data.pImage && pResources[i].data.pImage->pView)
+        {
+          id = GetResID(pResources[i].data.pImage->pView->image);
+        }
+        else if((pResources[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                 pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) &&
+                pResources[i].data.pTexelBuffer)
+        {
+          uint64_t offset = 0;
+          GetResIDFromAddr(pResources[i].data.pTexelBuffer->addressRange.address, id, offset);
+        }
+        else if((pResources[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                 pResources[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                 pResources[i].type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR ||
+                 pResources[i].type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV ||
+                 pResources[i].type ==
+                     VK_DESCRIPTOR_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_NV) &&
+                pResources[i].data.pAddressRange)
+        {
+          uint64_t offset = 0;
+          GetResIDFromAddr(pResources[i].data.pAddressRange->address, id, offset);
+        }
+
+        VkResourceRecord *resourceRecord = GetResourceManager()->GetResourceRecord(id);
+        if(resourceRecord)
+        {
+          if(record)
+            record->AddParent(resourceRecord);
+          else
+            record = resourceRecord;
+        }
+      }
+      if(!record)
+        record = GetRecord(device);
+      record->AddChunk(scope.Get());
+    }
+  }
+  return ret;
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCmdBindResourceHeapEXT(SerialiserType &ser,
+                                                        VkCommandBuffer commandBuffer,
+                                                        const VkBindHeapInfoEXT *pBindInfo)
+{
+  SERIALISE_ELEMENT(commandBuffer);
+  SERIALISE_ELEMENT_LOCAL(BindInfo, *pBindInfo).Important();
+  Serialise_DebugMessages(ser);
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    m_LastCmdBufferID = GetResID(commandBuffer);
+    VkCommandBuffer replayCmd = commandBuffer;
+    VulkanRenderState *state = &m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
+    bool execute = !IsActiveReplaying(m_State);
+    if(IsActiveReplaying(m_State) && InRerecordRange(m_LastCmdBufferID))
+    {
+      replayCmd = RerecordCmdBuf(m_LastCmdBufferID);
+      state = &GetCmdRenderState();
+      execute = true;
+    }
+
+    if(execute)
+    {
+      ObjDisp(replayCmd)->CmdBindResourceHeapEXT(Unwrap(replayCmd), &BindInfo);
+
+      state->InvalidateNonHeapDescriptorState();
+      state->descriptorHeapState = true;
+      state->resourceHeap.bound = true;
+      state->resourceHeap.address = BindInfo.heapRange.address;
+      state->resourceHeap.size = BindInfo.heapRange.size;
+      state->resourceHeap.reservedOffset = BindInfo.reservedRangeOffset;
+      state->resourceHeap.reservedSize = BindInfo.reservedRangeSize;
+    }
+  }
+  return true;
+}
+
+void WrappedVulkan::vkCmdBindResourceHeapEXT(VkCommandBuffer commandBuffer,
+                                              const VkBindHeapInfoEXT *pBindInfo)
+{
+  SCOPED_DBG_SINK();
+  SERIALISE_TIME_CALL(ObjDisp(commandBuffer)->CmdBindResourceHeapEXT(Unwrap(commandBuffer), pBindInfo));
+  if(IsCaptureMode(m_State))
+  {
+    VkResourceRecord *record = GetRecord(commandBuffer);
+    CACHE_THREAD_SERIALISER();
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCmdBindResourceHeapEXT);
+    Serialise_vkCmdBindResourceHeapEXT(ser, commandBuffer, pBindInfo);
+    record->AddChunk(scope.Get(&record->cmdInfo->alloc));
+
+    ResourceId heap;
+    uint64_t offset = 0;
+    GetResIDFromAddr(pBindInfo->heapRange.address, heap, offset);
+    VkResourceRecord *heapRecord = GetResourceManager()->GetResourceRecord(heap);
+    if(heapRecord)
+      record->MarkBufferFrameReferenced(heapRecord, offset, pBindInfo->heapRange.size,
+                                        eFrameRef_Read);
+  }
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCmdPushDataEXT(SerialiserType &ser, VkCommandBuffer commandBuffer,
+                                                const VkPushDataInfoEXT *pPushDataInfo)
+{
+  SERIALISE_ELEMENT(commandBuffer);
+  SERIALISE_ELEMENT_LOCAL(PushDataInfo, *pPushDataInfo).Important();
+  Serialise_DebugMessages(ser);
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    m_LastCmdBufferID = GetResID(commandBuffer);
+    VkCommandBuffer replayCmd = commandBuffer;
+    VulkanRenderState *state = &m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
+    bool execute = !IsActiveReplaying(m_State);
+    if(IsActiveReplaying(m_State) && InRerecordRange(m_LastCmdBufferID))
+    {
+      replayCmd = RerecordCmdBuf(m_LastCmdBufferID);
+      state = &GetCmdRenderState();
+      execute = true;
+    }
+
+    if(execute)
+    {
+      ObjDisp(replayCmd)->CmdPushDataEXT(Unwrap(replayCmd), &PushDataInfo);
+
+      state->InvalidateNonHeapDescriptorState();
+      state->descriptorHeapState = true;
+      state->pushData.resize(RDCMAX(state->pushData.size(),
+                                    size_t(PushDataInfo.offset + PushDataInfo.data.size)));
+      memcpy(state->pushData.data() + PushDataInfo.offset, PushDataInfo.data.address,
+             PushDataInfo.data.size);
+    }
+  }
+  return true;
+}
+
+void WrappedVulkan::vkCmdPushDataEXT(VkCommandBuffer commandBuffer,
+                                      const VkPushDataInfoEXT *pPushDataInfo)
+{
+  SCOPED_DBG_SINK();
+  SERIALISE_TIME_CALL(ObjDisp(commandBuffer)->CmdPushDataEXT(Unwrap(commandBuffer), pPushDataInfo));
+  if(IsCaptureMode(m_State))
+  {
+    VkResourceRecord *record = GetRecord(commandBuffer);
+    CACHE_THREAD_SERIALISER();
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCmdPushDataEXT);
+    Serialise_vkCmdPushDataEXT(ser, commandBuffer, pPushDataInfo);
+    record->AddChunk(scope.Get(&record->cmdInfo->alloc));
+  }
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkRegisterCustomBorderColorEXT(
+    SerialiserType &ser, VkDevice device,
+    const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor, VkBool32 requestIndex,
+    uint32_t *pIndex)
+{
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT_LOCAL(BorderColor, *pBorderColor).Important();
+  SERIALISE_ELEMENT(requestIndex);
+  SERIALISE_ELEMENT_LOCAL(Index, *pIndex).Important();
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    uint32_t replayIndex = Index;
+    VkResult vkr = ObjDisp(device)->RegisterCustomBorderColorEXT(
+        Unwrap(device), &BorderColor, VK_TRUE, &replayIndex);
+    if(vkr != VK_SUCCESS || replayIndex != Index)
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                       "Could not restore custom border color index %u: %s", Index,
+                       ToStr(vkr).c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
+VkResult WrappedVulkan::vkRegisterCustomBorderColorEXT(
+    VkDevice device, const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor,
+    VkBool32 requestIndex, uint32_t *pIndex)
+{
+  VkResult ret = ObjDisp(device)->RegisterCustomBorderColorEXT(Unwrap(device), pBorderColor,
+                                                               requestIndex, pIndex);
+  if(ret == VK_SUCCESS && IsCaptureMode(m_State))
+  {
+    CACHE_THREAD_SERIALISER();
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkRegisterCustomBorderColorEXT);
+    Serialise_vkRegisterCustomBorderColorEXT(ser, device, pBorderColor, requestIndex, pIndex);
+    GetRecord(device)->AddChunk(scope.Get());
+  }
+  return ret;
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkUnregisterCustomBorderColorEXT(SerialiserType &ser, VkDevice device,
+                                                                uint32_t index)
+{
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT(index).Important();
+  SERIALISE_CHECK_READ_ERRORS();
+  if(IsReplayingAndReading())
+    ObjDisp(device)->UnregisterCustomBorderColorEXT(Unwrap(device), index);
+  return true;
+}
+
+void WrappedVulkan::vkUnregisterCustomBorderColorEXT(VkDevice device, uint32_t index)
+{
+  ObjDisp(device)->UnregisterCustomBorderColorEXT(Unwrap(device), index);
+  if(IsCaptureMode(m_State))
+  {
+    CACHE_THREAD_SERIALISER();
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkUnregisterCustomBorderColorEXT);
+    Serialise_vkUnregisterCustomBorderColorEXT(ser, device, index);
+    GetRecord(device)->AddChunk(scope.Get());
+  }
+}
+
+INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdBindSamplerHeapEXT, VkCommandBuffer commandBuffer,
+                                const VkBindHeapInfoEXT *pBindInfo);
+INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdBindResourceHeapEXT, VkCommandBuffer commandBuffer,
+                                const VkBindHeapInfoEXT *pBindInfo);
+INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdPushDataEXT, VkCommandBuffer commandBuffer,
+                                const VkPushDataInfoEXT *pPushDataInfo);
+INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkWriteSamplerDescriptorsEXT, VkDevice device,
+                                uint32_t samplerCount, const VkSamplerCreateInfo *pSamplers,
+                                const VkHostAddressRangeEXT *pDescriptors);
+INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkWriteResourceDescriptorsEXT, VkDevice device,
+                                uint32_t resourceCount,
+                                const VkResourceDescriptorInfoEXT *pResources,
+                                const VkHostAddressRangeEXT *pDescriptors);
+INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkRegisterCustomBorderColorEXT, VkDevice device,
+                                const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor,
+                                VkBool32 requestIndex, uint32_t *pIndex);
+INSTANTIATE_FUNCTION_SERIALISED(void, vkUnregisterCustomBorderColorEXT, VkDevice device,
+                                uint32_t index);

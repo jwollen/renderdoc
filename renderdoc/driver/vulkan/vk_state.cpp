@@ -413,6 +413,38 @@ void VulkanRenderState::BindDescriptorBuffers(WrappedVulkan *vk, VkCommandBuffer
   }
 }
 
+void VulkanRenderState::BindDescriptorHeaps(WrappedVulkan *vk, VkCommandBuffer cmd)
+{
+  if(!descriptorHeapState)
+    return;
+
+  if(samplerHeap.bound)
+  {
+    VkBindHeapInfoEXT info = {VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
+    info.heapRange = {samplerHeap.address, samplerHeap.size};
+    info.reservedRangeOffset = samplerHeap.reservedOffset;
+    info.reservedRangeSize = samplerHeap.reservedSize;
+    ObjDisp(cmd)->CmdBindSamplerHeapEXT(Unwrap(cmd), &info);
+  }
+
+  if(resourceHeap.bound)
+  {
+    VkBindHeapInfoEXT info = {VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
+    info.heapRange = {resourceHeap.address, resourceHeap.size};
+    info.reservedRangeOffset = resourceHeap.reservedOffset;
+    info.reservedRangeSize = resourceHeap.reservedSize;
+    ObjDisp(cmd)->CmdBindResourceHeapEXT(Unwrap(cmd), &info);
+  }
+
+  if(!pushData.empty())
+  {
+    VkPushDataInfoEXT info = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+    info.offset = 0;
+    info.data = {pushData.data(), pushData.size()};
+    ObjDisp(cmd)->CmdPushDataEXT(Unwrap(cmd), &info);
+  }
+}
+
 void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
                                      PipelineBinding binding, bool subpass0)
 {
@@ -521,6 +553,10 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
       BindDescriptorSetsForPipeline(vk, cmd, rt, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     }
   }
+
+  // Descriptor heap state is mutually exclusive with descriptor sets, descriptor buffers and
+  // push constants. Apply it last so any normal state restored above is invalidated as required.
+  BindDescriptorHeaps(vk, cmd);
 }
 
 void VulkanRenderState::BindShaderObjects(WrappedVulkan *vk, VkCommandBuffer cmd,

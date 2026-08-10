@@ -485,6 +485,8 @@ void WrappedVulkan::vkGetDeviceBufferMemoryRequirements(VkDevice device,
   uint64_t usage = GetBufferUsageFlags(info);
   usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
   usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if(IsCaptureMode(m_State) && (usage & VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT))
+    usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   SetBufferUsageFlags(info, usage);
 
   if(IsCaptureMode(m_State) && (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT))
@@ -1537,6 +1539,24 @@ VkResult WrappedVulkan::vkGetSamplerOpaqueCaptureDescriptorDataEXT(
 
   return ObjDisp(device)->GetSamplerOpaqueCaptureDescriptorDataEXT(Unwrap(device), &unwrappedInfo,
                                                                    pData);
+}
+
+VkResult WrappedVulkan::vkGetImageOpaqueCaptureDataEXT(VkDevice device, uint32_t imageCount,
+                                                        const VkImage *pImages,
+                                                        VkHostAddressRangeEXT *pDatas)
+{
+  VkImage *unwrappedImages = GetTempArray<VkImage>(imageCount);
+  for(uint32_t i = 0; i < imageCount; i++)
+    unwrappedImages[i] = Unwrap(pImages[i]);
+  return ObjDisp(device)->GetImageOpaqueCaptureDataEXT(Unwrap(device), imageCount, unwrappedImages,
+                                                       pDatas);
+}
+
+VkDeviceSize WrappedVulkan::vkGetPhysicalDeviceDescriptorSizeEXT(
+    VkPhysicalDevice physicalDevice, VkDescriptorType descriptorType)
+{
+  return ObjDisp(physicalDevice)->GetPhysicalDeviceDescriptorSizeEXT(Unwrap(physicalDevice),
+                                                                      descriptorType);
 }
 
 VkResult WrappedVulkan::vkGetAccelerationStructureOpaqueCaptureDescriptorDataEXT(

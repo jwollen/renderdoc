@@ -3626,6 +3626,25 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDescriptorHeapFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(descriptorHeap);
+        CHECK_PHYS_EXT_FEATURE(descriptorHeapCaptureReplay);
+
+        if(ext->descriptorHeap && !avail.descriptorHeapCaptureReplay)
+        {
+          SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                           "Capture requires descriptorHeapCaptureReplay support, which is not "
+                           "available on the replay device\n\n%s",
+                           GetPhysDeviceCompatString(false, false).c_str());
+          return false;
+        }
+        if(ext->descriptorHeap)
+          ext->descriptorHeapCaptureReplay = VK_TRUE;
+      }
+      END_PHYS_EXT_CHECK();
+
       BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderBfloat16FeaturesKHR,
                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR);
       {
@@ -4659,6 +4678,20 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       m_IgnoreLayoutForDescriptors = descBufFeats->descriptorBufferImageLayoutIgnored != VK_FALSE;
     }
 
+    const VkPhysicalDeviceDescriptorHeapFeaturesEXT *descHeapFeats =
+        (const VkPhysicalDeviceDescriptorHeapFeaturesEXT *)FindNextStruct(
+            &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT);
+    if(m_EnabledExtensions.ext_EXT_descriptor_heap && descHeapFeats && descHeapFeats->descriptorHeap)
+    {
+      m_DescriptorHeaps = true;
+      m_DescriptorHeapProperties = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT,
+      };
+      VkPhysicalDeviceProperties2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      availBase.pNext = &m_DescriptorHeapProperties;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &availBase);
+    }
+
     // MoltenVK reports 0x3fffffff for this limit so just ignore that value if it comes up
     RDCASSERT(m_PhysicalDeviceData.props.limits.maxBoundDescriptorSets <
                       ARRAY_COUNT(BakedCmdBufferInfo::pushDescriptorID[0]) ||
@@ -5087,6 +5120,16 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     RDCLOG("descriptor buffers enabled, ALL MEMORY WILL BE MARKED AS BDA");
   }
 
+  VkPhysicalDeviceDescriptorHeapFeaturesEXT *descHeapFeatures =
+      (VkPhysicalDeviceDescriptorHeapFeaturesEXT *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT);
+  if(descHeapFeatures && descHeapFeatures->descriptorHeap)
+  {
+    descHeapFeatures->descriptorHeapCaptureReplay = VK_TRUE;
+    m_DescriptorHeaps = true;
+    RDCLOG("descriptor heaps enabled, ALL MEMORY WILL BE MARKED AS BDA");
+  }
+
   VkResult ret;
   SERIALISE_TIME_CALL(ret = createFunc(Unwrap(physicalDevice), &createInfo, NULL, pDevice));
 
@@ -5404,6 +5447,17 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       }
 
       m_NULLDescriptorPatternSaved = true;
+    }
+
+    if(m_EnabledExtensions.ext_EXT_descriptor_heap && descHeapFeatures &&
+       descHeapFeatures->descriptorHeap)
+    {
+      m_DescriptorHeapProperties = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT,
+      };
+      VkPhysicalDeviceProperties2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      availBase.pNext = &m_DescriptorHeapProperties;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &availBase);
     }
 
     m_PhysicalDeviceData.driverInfo =
